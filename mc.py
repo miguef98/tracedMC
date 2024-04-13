@@ -4,10 +4,23 @@ import numpy as np
 def sdf( x ):
     return np.linalg.norm( x, axis=1 )[...,None] - 0.5
 
-def updateDict( hitPositions, N, axis, edgeVertexs, cubeData, polygons ):
+def getCubeIndexs( hitPositions, axis, rayIndexs, N ):
+    index = np.floor( (hitPositions[:, axis] + 1) * ((N-1)/2) ).astype(np.uint32)
+    
+    if axis == 0:
+        indexs = np.concatenate( [ index[...,None], rayIndexs[:,0][...,None], rayIndexs[:,1][...,None] ], axis=1 )
+    elif axis == 1:
+        indexs = np.concatenate( [ rayIndexs[:,0][...,None], index[...,None], rayIndexs[:,1][...,None] ], axis=1 )
+    elif axis == 2:
+        indexs = np.concatenate( [ rayIndexs[:,0][...,None], rayIndexs[:,1][...,None], index[...,None] ], axis=1 )
+
+    return indexs
+
+def updateDict( hitPositions, rayIndexs, N, axis, edgeVertexs, cubeData, polygons ):
     # grid indexed from (back, left, down) to (front, right, up)
 
-    indexs = np.floor( (hitPositions + 1) * ((N-1)/2) ).astype(np.uint32)
+    indexs = getCubeIndexs( hitPositions, axis, rayIndexs, N )
+    #indexs = np.floor( (hitPositions + 1) * ((N-1)/2) ).astype(np.uint32)
     #indexs = (hitPositions + 1) * ((N-1)/2)
     for mainCubeIndex, edgeVertex in zip(indexs, hitPositions):
         edgeVertexIndex = len(edgeVertexs)
@@ -16,16 +29,16 @@ def updateDict( hitPositions, N, axis, edgeVertexs, cubeData, polygons ):
         if axis == 0:
             offsets = np.array([[0,0,0], [0,-1,0],[0,0,-1],[0,-1,-1]])
         
-        if axis == 1:
+        elif axis == 1:
             offsets = np.array([[0,0,0], [-1,0,0],[0,0,-1],[-1,0,-1]])
 
-        if axis == 2:
+        elif axis == 2:
             offsets = np.array([[0,0,0], [-1,0,0],[0,-1,0],[-1,-1,0]])
         
         polygon = []
         for offset in offsets:
             cubeIndex = mainCubeIndex + offset
-            if np.all( np.logical_and( (cubeIndex >= 0), (cubeIndex < N)) ):
+            if np.all( np.logical_and( (cubeIndex >= 0), (cubeIndex < (N-1))) ):
                 polygon.append( tuple(cubeIndex) )
                 if tuple(cubeIndex) in cubeData:
                     cubeData[tuple(cubeIndex)]['edgeVertexIndexs'].append(edgeVertexIndex)
@@ -51,25 +64,28 @@ def genGrid( N, axis ):
 
 def rayMarch( rayPositions, axis, df, N, outDict, edgeVertexs, polygons, surfaceThresh = 1e-5 ):
     aliveRays = np.ones( N**2, dtype=bool )
+    x,y=np.meshgrid( np.arange(N),np.arange(N), indexing='xy' )
+    rayIndexs = np.concatenate( [x[...,None], y[...,None]], axis=2 ).reshape(N**2, 2)
 
     while np.sum(aliveRays) > 0:
         distances = np.abs( df(rayPositions) )
         rayPositions[ ..., axis ][ ..., None ] += distances
-        aliveRays *= rayPositions[ ..., axis ] < 1
+        aliveRays = np.logical_and( aliveRays, rayPositions[ ..., axis ] < 1 )
 
-        surfaceHitRays = (distances.flatten() < surfaceThresh) * aliveRays
+        surfaceHitRays = np.logical_and( distances.flatten() < surfaceThresh, aliveRays)
         surfaceHitPosition = rayPositions[ surfaceHitRays ]
 
-        if np.sum(surfaceHitRays) > 0:
+        if np.sum(surfaceHitRays) > 0:            
             updateDict( 
                 surfaceHitPosition,
+                rayIndexs[surfaceHitRays],
                 N,
                 axis,
                 edgeVertexs,
                 outDict,
                 polygons
             )
-            rayPositions[surfaceHitRays, axis] =  np.ceil( (surfaceHitPosition[:, axis] + 1) * (N/2) ).astype(np.uint32) * (2/N) - 1
+            rayPositions[surfaceHitRays, axis] =  (np.floor( (surfaceHitPosition[:, axis] + 1) * ((N-1)/2) ) + 1) * (2/(N-1)) - 1
 
 def cubeVertexs( N, df, surfaceThresh ):
     edgeVertexs = []
