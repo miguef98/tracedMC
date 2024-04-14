@@ -1,8 +1,29 @@
-#import open3d as o3d
+import open3d as o3d
+import open3d.core as o3c
 import numpy as np
+from scipy.spatial import KDTree
 
-def sdf( x ):
+def df( x ):
+    # spot numerico
+    return spotScene.compute_distance( o3c.Tensor(x, dtype=o3c.float32) ).numpy()[...,None]
+
+    # esfera
     return np.linalg.norm( x, axis=1 )[...,None] - 0.5
+
+def g_df( x ):
+
+
+    # spot numerico
+    EPS = 0.001
+    gradient = ( np.array( [ 
+        df( x + np.tile( dx, (len(x),1)) ) - df( x - np.tile( dx, (len(x),1)))
+        for dx in np.array( [[ EPS, 0,0 ], [0, EPS,0 ], [0,0,EPS]] )
+    ] ) / (2* EPS) ).reshape( x.shape )
+
+    return gradient / np.linalg.norm( gradient, axis=1 )[..., None]
+
+    # esfera
+    return x / np.linalg.norm( x, axis=1 )[..., None]
 
 def getCubeIndexs( hitPositions, axis, rayIndexs, N ):
     index = np.floor( (hitPositions[:, axis] + 1) * ((N-1)/2) ).astype(np.uint32)
@@ -16,15 +37,16 @@ def getCubeIndexs( hitPositions, axis, rayIndexs, N ):
 
     return indexs
 
-def updateDict( hitPositions, rayIndexs, N, axis, edgeVertexs, cubeData, polygons ):
+def updateDict( hitPositions, hitNormals, rayIndexs, N, axis, edgeVertexs, edgeNormals, cubeData, polygons ):
     # grid indexed from (back, left, down) to (front, right, up)
 
     indexs = getCubeIndexs( hitPositions, axis, rayIndexs, N )
     #indexs = np.floor( (hitPositions + 1) * ((N-1)/2) ).astype(np.uint32)
     #indexs = (hitPositions + 1) * ((N-1)/2)
-    for mainCubeIndex, edgeVertex in zip(indexs, hitPositions):
+    for mainCubeIndex, edgeVertex, edgeNormal in zip(indexs, hitPositions, hitNormals):
         edgeVertexIndex = len(edgeVertexs)
         edgeVertexs.append(edgeVertex)
+        edgeNormals.append(edgeNormal)
 
         if axis == 0:
             offsets = np.array([[0,0,0], [0,-1,0],[0,0,-1],[0,-1,-1]])
@@ -62,7 +84,7 @@ def genGrid( N, axis ):
     
     return np.concatenate( [xs[...,None],ys[...,None],zs[...,None]], axis=2).reshape(N**2, 3)    
 
-def rayMarch( rayPositions, axis, df, N, outDict, edgeVertexs, polygons, surfaceThresh = 1e-5 ):
+def rayMarch( rayPositions, axis, df, N, outDict, edgeVertexs, edgeNormals, polygons, surfaceThresh = 1e-5 ):
     aliveRays = np.ones( N**2, dtype=bool )
     x,y=np.meshgrid( np.arange(N),np.arange(N), indexing='xy' )
     rayIndexs = np.concatenate( [x[...,None], y[...,None]], axis=2 ).reshape(N**2, 2)
@@ -75,13 +97,16 @@ def rayMarch( rayPositions, axis, df, N, outDict, edgeVertexs, polygons, surface
         surfaceHitRays = np.logical_and( distances.flatten() < surfaceThresh, aliveRays)
         surfaceHitPosition = rayPositions[ surfaceHitRays ]
 
-        if np.sum(surfaceHitRays) > 0:            
+        if np.sum(surfaceHitRays) > 0:
+            surfaceHitNormals = g_df( surfaceHitPosition )
             updateDict( 
                 surfaceHitPosition,
+                surfaceHitNormals,
                 rayIndexs[surfaceHitRays],
                 N,
                 axis,
                 edgeVertexs,
+                edgeNormals,
                 outDict,
                 polygons
             )
@@ -89,18 +114,19 @@ def rayMarch( rayPositions, axis, df, N, outDict, edgeVertexs, polygons, surface
 
 def cubeVertexs( N, df, surfaceThresh ):
     edgeVertexs = []
+    edgeNormals = []
     polygons = []
     cubeData = {}
     for axis in range(3):
         rayPositions = genGrid( N, axis )
-        rayMarch(rayPositions, axis, df, N, cubeData, edgeVertexs, polygons, surfaceThresh=surfaceThresh )
+        rayMarch(rayPositions, axis, df, N, cubeData, edgeVertexs, edgeNormals, polygons, surfaceThresh=surfaceThresh )
 
-    return cubeData, np.array(edgeVertexs), polygons
+    return cubeData, np.array(edgeVertexs),np.array(edgeNormals), polygons
 
-def cubeCenterVertex( cubeData, edgeVertexs ):
+def cubeCenterVertex( cubeData, edgeVertexs, edgeNormals ):
     for cubeIdx, cubeInfo in cubeData.items():
         P = np.array( edgeVertexs[cubeInfo['edgeVertexIndexs']] )
-        A = P / np.linalg.norm(P, axis=1)[...,None]
+        A = np.array( edgeNormals[cubeInfo['edgeVertexIndexs']] )
 
         if len(A) == 1:
             cubeData[cubeIdx]['vertex'] = P.flatten()
@@ -108,8 +134,8 @@ def cubeCenterVertex( cubeData, edgeVertexs ):
             cubeData[cubeIdx]['vertex'] = (P.sum(0) / 2).flatten()
         else:
             b = np.sum( A * P, axis=1).flatten()
-            x,_,_,_ = np.linalg.lstsq( A, b, rcond=None )
-            #x = np.linalg.solve( A.T @ A, A.T @ b )
+            #x,_,_,_ = np.linalg.lstsq( A, b, rcond=None )
+            x = np.linalg.solve( A.T @ A, A.T @ b )
 
             cubeData[cubeIdx]['vertex'] = x.flatten()
 
@@ -143,20 +169,24 @@ def generateSurface( cubeData, polygons ):
     return np.array(vertices), np.array(triangles)
 
 def tracedMarchingCubes( N, surfaceThresh=1e-5 ):
-    d, ev, p = cubeVertexs( N, sdf, surfaceThresh=1e-5 )
-    cubeCenterVertex( d, ev )
+    d, ev, en, p = cubeVertexs( N, df, surfaceThresh=1e-5 )
+    cubeCenterVertex( d, ev, en )
     
     return generateSurface( d, p )
 
-if __name__ == '__main__':
+spotMesh = o3d.t.io.read_triangle_mesh('spot.obj')
+spotScene = o3d.t.geometry.RaycastingScene()
+spotScene.add_triangles(spotMesh)
+
+#if __name__ == '__main__':
     #print( len( list( cubeVertexs( 32, sdf ).keys() ) ))
     #print( np.concatenate( np.array(np.meshgrid( np.arange(3), np.arange(3), indexing='ij'))[...,None], axis=2 ))
     #print(genGrid( 3, 2 ))
     #quit()
-    d, ev, p = cubeVertexs( 4, sdf, surfaceThresh=1e-5 )
-    cubeCenterVertex( d, ev )
+    #d, ev, p = cubeVertexs( 4, df, surfaceThresh=1e-5 )
+    #cubeCenterVertex( d, ev )
     
-    v,t = generateSurface( d, p )
+    #v,t = generateSurface( d, p )
 
     #print( len(list(d.keys()) ))
 
