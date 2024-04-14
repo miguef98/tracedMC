@@ -4,14 +4,17 @@ import numpy as np
 from scipy.spatial import KDTree
 
 def df( x ):
-    # spot numerico
-    return spotScene.compute_distance( o3c.Tensor(x, dtype=o3c.float32) ).numpy()[...,None]
-
     # esfera
     return np.linalg.norm( x, axis=1 )[...,None] - 0.5
 
+    # spot numerico
+    return spotScene.compute_distance( o3c.Tensor(x, dtype=o3c.float32) ).numpy()[...,None]
+
+
 def g_df( x ):
 
+    # esfera
+    return x / np.linalg.norm( x, axis=1 )[..., None] * np.random.choice( [-1,1], (x.shape[0],1))
 
     # spot numerico
     EPS = 0.001
@@ -22,8 +25,6 @@ def g_df( x ):
 
     return gradient / np.linalg.norm( gradient, axis=1 )[..., None]
 
-    # esfera
-    return x / np.linalg.norm( x, axis=1 )[..., None]
 
 def getCubeIndexs( hitPositions, axis, rayIndexs, N ):
     index = np.floor( (hitPositions[:, axis] + 1) * ((N-1)/2) ).astype(np.uint32)
@@ -134,8 +135,8 @@ def cubeCenterVertex( cubeData, edgeVertexs, edgeNormals ):
             cubeData[cubeIdx]['vertex'] = (P.sum(0) / 2).flatten()
         else:
             b = np.sum( A * P, axis=1).flatten()
-            #x,_,_,_ = np.linalg.lstsq( A, b, rcond=None )
-            x = np.linalg.solve( A.T @ A, A.T @ b )
+            x,_,_,_ = np.linalg.lstsq( A, b, rcond=None )
+            #x = np.linalg.solve( A.T @ A, A.T @ b )
 
             cubeData[cubeIdx]['vertex'] = x.flatten()
 
@@ -174,9 +175,9 @@ def tracedMarchingCubes( N, surfaceThresh=1e-5 ):
     
     return generateSurface( d, p )
 
-spotMesh = o3d.t.io.read_triangle_mesh('spot.obj')
-spotScene = o3d.t.geometry.RaycastingScene()
-spotScene.add_triangles(spotMesh)
+#spotMesh = o3d.t.io.read_triangle_mesh('spot.obj')
+#spotScene = o3d.t.geometry.RaycastingScene()
+#spotScene.add_triangles(spotMesh)
 
 #if __name__ == '__main__':
     #print( len( list( cubeVertexs( 32, sdf ).keys() ) ))
