@@ -1,18 +1,40 @@
-import open3d as o3d
-import open3d.core as o3c
 import numpy as np
-from scipy.spatial import KDTree
+from dudf.model import SIREN
+from dudf.evaluate import evaluate
+from scipy.optimize import minimize
+import torch
+
+model = SIREN(
+            n_in_features= 3,
+            n_out_features=1,
+            hidden_layer_config=[256]*8,
+            w0=30,
+            ww=None,
+            activation='sine'
+)
+model.load_state_dict( torch.load('spot_smooth/model_best.pth'))
+device_torch = torch.device(0)
+model.to(device_torch)
 
 def df( x ):
+    # spot dudf
+    return evaluate( model, x, device=device_torch)
     # esfera
     return np.linalg.norm( x, axis=1 )[...,None] - 0.5
-
+    
     # spot numerico
     return spotScene.compute_distance( o3c.Tensor(x, dtype=o3c.float32) ).numpy()[...,None]
 
 
 def g_df( x ):
+    # dudf
+    gradients = np.zeros_like(x)
+    hessians = np.zeros((x.shape[0], 3, 3))
+    pred_distances = evaluate( model, x, device=device_torch, gradients=gradients, hessians=hessians )
+    eigenvalues, eigenvectors = torch.linalg.eigh( torch.from_numpy(hessians) )
+    pred_normals = eigenvectors[..., 2].numpy()
 
+    return pred_normals
     # esfera
     return x / np.linalg.norm( x, axis=1 )[..., None] * np.random.choice( [-1,1], (x.shape[0],1))
 
@@ -25,6 +47,108 @@ def g_df( x ):
 
     return gradient / np.linalg.norm( gradient, axis=1 )[..., None]
 
+def ransac( A, b ):
+    if A.shape[0] == 3:
+        return leastSquares(A,b)
+    else:
+        x_best = None
+        error_best = np.inf
+        for i in range(20):
+            subsetIdx = np.random.choice(A.shape[0], np.random.randint(3, A.shape[0]))
+            A_bar = A[ subsetIdx , : ]
+            b_bar = b[ subsetIdx ]
+
+            x_bar = leastSquares( A_bar, b_bar )
+            error_bar = np.linalg.norm( A_bar @ x_bar - b_bar )
+
+            if error_best > error_bar:
+                x_best = x_bar
+                error_best = error_bar
+
+        return x_best            
+
+def leastSquares( A, b, threshold=0.1 ):
+    _, R = np.linalg.qr( np.concatenate([A,b[...,None]], axis = 1), mode='reduced' )
+    A_hat = R[:3, :3]
+    b_hat = R[:3, 3]
+
+    U,S,V = np.linalg.svd( A_hat, full_matrices=True )
+
+    S_inv = np.zeros_like( S )
+    np.divide( np.ones_like(S), S, where=S > threshold, out=S_inv )
+
+    A_hat_pseudoinv = V.T @ np.diag( S_inv ) @ U.T
+
+    return A_hat_pseudoinv @ b_hat
+
+def dualContour( A, b, threshold ):
+    # paper
+    return leastSquares( A, b, threshold=threshold )
+    
+    # paper + ransac
+    return ransac( A, b )
+
+    # recta plano
+    planeParams = leastSquares( np.hstack([X, np.ones((X.shape[0],1)) ]), np.zeros(X.shape[0]) )
+    planeNormal = planeParams[:3]
+    centerOfMass = np.sum(X, axis=0) / X.shape[0]
+
+    lambdaMin = (planeNormal.T @ A.T @ b - planeNormal.T @ A.T @ A @ centerOfMass) / (planeNormal.T @ A.T @ A @ planeNormal)
+
+    return lambdaMin * planeNormal + centerOfMass
+
+    # recta plano v2
+    planeNormal = np.sum(A, axis=0) / A.shape[0] # que pasa si las normales miran opuestas ?
+    planeNormal /= np.linalg.norm(planeNormal)
+    centerOfMass = np.sum(X, axis=0) / X.shape[0]
+
+    lambdaMin = (planeNormal.T @ A.T @ b - planeNormal.T @ A.T @ A @ centerOfMass) / (planeNormal.T @ A.T @ A @ planeNormal)
+
+    return lambdaMin * planeNormal + centerOfMass
+
+    # equidistancia con minimizacion
+    def f(x, epsilon):
+        v = x @ x.T * np.ones( X.shape[0] ) - 2 * x @ X.T + np.sum( X * X, axis=1 ) -  epsilon * np.ones(X.shape[0])
+        return v.T @ v
+
+    v1 = minimize( lambda x: f(x, 0.1), (np.sum(X, axis=0) / X.shape[0]) ).x
+    v2 = minimize( lambda x: f(x, 0.9), (np.sum(X, axis=0) / X.shape[0]) ).x
+
+    if np.isclose(np.linalg.norm(v2 - v1), 0):
+        return np.sum(X, axis=0)
+
+    planeNormal = (v2 - v1) / np.linalg.norm(v2 - v1)
+    centerOfMass = v1
+    
+    # equidistancia con CML
+    epsilon = 0.01
+    A_lst = -2 * X
+    b_lst = np.sum( X * X, axis=1 ) -  epsilon * np.ones_like(b)
+
+    return leastSquares( A_lst, b_lst )
+
+
+    # double energy
+    lambda1 = 0 #0.01
+    lambda2 = 1
+    C = np.hstack( [ np.ones((X.shape[0], 1)), np.zeros((X.shape[0], X.shape[0]-1))] ) - np.eye(X.shape[0], X.shape[0])
+    A2 = C @ X
+    b2 = np.diag( X @ X.T ) / 2
+
+    A = np.vstack([ np.sqrt(lambda1) * A, np.sqrt(lambda2) * A2 ])
+    b = np.vstack([ np.sqrt(lambda1) * b[...,None], np.sqrt(lambda2) * b2[...,None] ]).flatten()
+
+    #center of mass
+    return np.sum(X, axis=0) / len(X)
+    
+    # bounded optimization
+    E =  lambda x: (A @ x - b).T @ (A @ x - b)
+    return minimize( E, x0, bounds=bounds ).x
+
+
+    # numpy
+    x,_,_,sv = np.linalg.lstsq( A, b, rcond=None )
+    return x.flatten()
 
 def getCubeIndexs( hitPositions, axis, rayIndexs, N ):
     index = np.floor( (hitPositions[:, axis] + 1) * ((N-1)/2) ).astype(np.uint32)
@@ -40,10 +164,8 @@ def getCubeIndexs( hitPositions, axis, rayIndexs, N ):
 
 def updateDict( hitPositions, hitNormals, rayIndexs, N, axis, edgeVertexs, edgeNormals, cubeData, polygons ):
     # grid indexed from (back, left, down) to (front, right, up)
-
     indexs = getCubeIndexs( hitPositions, axis, rayIndexs, N )
-    #indexs = np.floor( (hitPositions + 1) * ((N-1)/2) ).astype(np.uint32)
-    #indexs = (hitPositions + 1) * ((N-1)/2)
+
     for mainCubeIndex, edgeVertex, edgeNormal in zip(indexs, hitPositions, hitNormals):
         edgeVertexIndex = len(edgeVertexs)
         edgeVertexs.append(edgeVertex)
@@ -51,22 +173,29 @@ def updateDict( hitPositions, hitNormals, rayIndexs, N, axis, edgeVertexs, edgeN
 
         if axis == 0:
             offsets = np.array([[0,0,0], [0,-1,0],[0,0,-1],[0,-1,-1]])
+            edges = [ 3, 1, 7, 5 ]
         
         elif axis == 1:
             offsets = np.array([[0,0,0], [-1,0,0],[0,0,-1],[-1,0,-1]])
+            edges = [ 0, 2, 4, 6 ]
 
         elif axis == 2:
             offsets = np.array([[0,0,0], [-1,0,0],[0,-1,0],[-1,-1,0]])
+            edges = [ 8, 9, 11, 10 ]
         
         polygon = []
-        for offset in offsets:
+        for offset, edge in zip( offsets, edges):
             cubeIndex = mainCubeIndex + offset
             if np.all( np.logical_and( (cubeIndex >= 0), (cubeIndex < (N-1))) ):
                 polygon.append( tuple(cubeIndex) )
                 if tuple(cubeIndex) in cubeData:
-                    cubeData[tuple(cubeIndex)]['edgeVertexIndexs'].append(edgeVertexIndex)
+                    if edge in cubeData[tuple(cubeIndex)]['edgeVertexIndexs']:
+                        raise Exception('ups')
+                        cubeData[tuple(cubeIndex)]['edgeVertexIndexs'][edge].append(edgeVertexIndex)    
+                    else:
+                        cubeData[tuple(cubeIndex)]['edgeVertexIndexs'][edge] = [ edgeVertexIndex ]
                 else:
-                    cubeData[tuple(cubeIndex)] = { 'edgeVertexIndexs':[ edgeVertexIndex ] }
+                    cubeData[tuple(cubeIndex)] = { 'edgeVertexIndexs': { edge: [ edgeVertexIndex ] } } 
 
         polygons.append(polygon)
 
@@ -111,7 +240,9 @@ def rayMarch( rayPositions, axis, df, N, outDict, edgeVertexs, edgeNormals, poly
                 outDict,
                 polygons
             )
-            rayPositions[surfaceHitRays, axis] =  (np.floor( (surfaceHitPosition[:, axis] + 1) * ((N-1)/2) ) + 1) * (2/(N-1)) - 1
+            
+            rayPositions[surfaceHitRays, axis] =  (np.floor( (surfaceHitPosition[:, axis] + 1) * ((N-1)/2) ) + 1 + 2 * surfaceThresh) * (2/(N-1)) - 1
+
 
 def cubeVertexs( N, df, surfaceThresh ):
     edgeVertexs = []
@@ -124,21 +255,22 @@ def cubeVertexs( N, df, surfaceThresh ):
 
     return cubeData, np.array(edgeVertexs),np.array(edgeNormals), polygons
 
-def cubeCenterVertex( cubeData, edgeVertexs, edgeNormals ):
+def cubeCenterVertex( cubeData, edgeVertexs, edgeNormals, N, threshold ):
     for cubeIdx, cubeInfo in cubeData.items():
-        P = np.array( edgeVertexs[cubeInfo['edgeVertexIndexs']] )
-        A = np.array( edgeNormals[cubeInfo['edgeVertexIndexs']] )
+        X = np.mean( [ edgeVertexs[ idxPerEdge ] for idxPerEdge in cubeInfo['edgeVertexIndexs'].values() ], axis=0)
+        A = np.mean( [ edgeNormals[ idxPerEdge ] for idxPerEdge in cubeInfo['edgeVertexIndexs'].values() ], axis=0)
 
         if len(A) == 1:
-            cubeData[cubeIdx]['vertex'] = P.flatten()
-        elif len(A) == 2:
-            cubeData[cubeIdx]['vertex'] = (P.sum(0) / 2).flatten()
+            cubeData[cubeIdx]['vertex'] = X.flatten()
+        #elif len(A) == 2:
+        #    cubeData[cubeIdx]['vertex'] = (X.sum(0) / 2).flatten()
         else:
-            b = np.sum( A * P, axis=1).flatten()
-            x,_,_,_ = np.linalg.lstsq( A, b, rcond=None )
-            #x = np.linalg.solve( A.T @ A, A.T @ b )
+            b = np.sum( A * X, axis=1).flatten()
+            dual = dualContour( A, b, threshold=threshold )
+            #bounds = [ (-1 + i*2/(N-1), -1 + (i+1)*2/(N-1)) for i in cubeIdx ]
+            #dual = dualContour( A, b, np.sum(X, axis=0) / X.shape[0], bounds )
 
-            cubeData[cubeIdx]['vertex'] = x.flatten()
+            cubeData[cubeIdx]['vertex'] = dual # x.flatten()
 
 def getVertexIndex( cubeIndex, cubeData, vertexIndexs, vertices):
     if cubeIndex not in vertexIndexs:
@@ -156,7 +288,7 @@ def generateSurface( cubeData, polygons ):
     for polygon in polygons:
         if len(polygon) == 4:
             t1 = [ getVertexIndex( cubeIndex, cubeData, vertexIndexs, vertices ) for cubeIndex in polygon[:3]]
-            t2 = [ getVertexIndex( cubeIndex, cubeData, vertexIndexs, vertices ) for cubeIndex in reversed(polygon[1:])]
+            t2 = [ getVertexIndex( cubeIndex, cubeData, vertexIndexs, vertices ) for cubeIndex in polygon[1:]] #reversed(polygon[1:])]
 
 
             triangles.append(t1)
@@ -170,10 +302,12 @@ def generateSurface( cubeData, polygons ):
     return np.array(vertices), np.array(triangles)
 
 def tracedMarchingCubes( N, surfaceThresh=1e-5 ):
-    d, ev, en, p = cubeVertexs( N, df, surfaceThresh=1e-5 )
-    cubeCenterVertex( d, ev, en )
-    
-    return generateSurface( d, p )
+    d, ev, en, p = cubeVertexs( N, df, surfaceThresh=surfaceThresh )
+    cubeCenterVertex( d, ev, en,N )
+
+    v,t = generateSurface( d, p )
+    return v,t
+
 
 #spotMesh = o3d.t.io.read_triangle_mesh('spot.obj')
 #spotScene = o3d.t.geometry.RaycastingScene()
