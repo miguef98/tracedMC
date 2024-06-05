@@ -5,6 +5,10 @@ from scipy.optimize import minimize
 import torch
 import networkx as nx
 
+
+def inv_tanh( pred_df, alpha ):
+    return np.where( pred_df < 1/alpha, np.sqrt(pred_df / alpha ), pred_df )
+
 model = SIREN(
             n_in_features= 3,
             n_out_features=1,
@@ -19,7 +23,7 @@ model.to(device_torch)
 
 def df( x ):
     # spot dudf
-    return evaluate( model, x, device=device_torch)
+    return inv_tanh( np.abs( evaluate( model, x, device=device_torch) ), 100 )
     
     # esfera
     return np.linalg.norm( x, axis=1 )[...,None] - 0.5
@@ -41,8 +45,6 @@ def g_df( x ):
     # esfera
     return x / np.linalg.norm( x, axis=1 )[..., None] * np.random.choice( [-1,1], (x.shape[0],1))
 
-
-
     # spot numerico
     EPS = 0.001
     gradient = ( np.array( [ 
@@ -52,8 +54,18 @@ def g_df( x ):
 
     return gradient / np.linalg.norm( gradient, axis=1 )[..., None]
 
+def grad_desc( x, it=1 ):
+    x = np.copy(x)
+    for _ in range(it):
+        gradients = np.zeros_like(x)
+        pred_distances = inv_tanh( np.abs( evaluate( model, x, device=device_torch, gradients=gradients )), 100 ) 
+
+        x -= pred_distances * gradients
+
+    return x
+
 def ransac( X, A, b ):
-    if A.shape[0] == 3:
+    if A.shape[0] <= 3:
         return leastSquares(X, A,b)
     else:
         x_best = None
@@ -71,7 +83,12 @@ def ransac( X, A, b ):
                 x_best = x_bar
                 error_best = error_bar
 
-        return x_best            
+        return x_best
+
+def weightedLeastSquares( W, X, A, b, threshold=0.1 ):
+    # W should be diagonal positive matrix
+    W_sqrt = np.sqrt(W)
+    return leastSquares( X, W_sqrt @ A, W_sqrt @ b, threshold )    
 
 def leastSquares( X, A, b, threshold=0.1 ):
     U,S,V_t = np.linalg.svd( A )
@@ -116,9 +133,9 @@ def leastSquares( X, A, b, threshold=0.1 ):
 def dualContour( X, A, b, threshold ):
     # paper
     return leastSquares( X, A, b, threshold=threshold )
-
     # paper + ransac
     return ransac(X, A, b )
+
 
     #center of mass
     return np.mean(X, axis=0)
@@ -182,6 +199,7 @@ def dualContour( X, A, b, threshold ):
     return x.flatten()
 
 def getCubeIndexs( hitPositions, axis, rayIndexs, N ):
+    
     index = np.floor( (hitPositions[:, axis] + 1) * ((N-1)/2) ).astype(np.uint32)
     
     if axis == 0:
@@ -193,11 +211,14 @@ def getCubeIndexs( hitPositions, axis, rayIndexs, N ):
 
     return indexs
 
-def updateDict( hitPositions, hitNormals, rayIndexs, N, axis, edgeVertexs, edgeNormals, cubeData, polygons ):
+def updateDict( hitPositions, rayIndexs, N, axis, edgeVertexs, edgeNormals, cubeData, polygons ):
     # grid indexed from (back, left, down) to (front, right, up)
     indexs = getCubeIndexs( hitPositions, axis, rayIndexs, N )
 
-    for mainCubeIndex, edgeVertex, edgeNormal in zip(indexs, hitPositions, hitNormals):
+    descPositions = grad_desc(hitPositions, it=1)
+    hitNormals = g_df(descPositions)
+
+    for mainCubeIndex, edgeVertex, edgeNormal in zip(indexs, descPositions, hitNormals):
         edgeVertexIndex = len(edgeVertexs)
         edgeVertexs.append(edgeVertex)
         edgeNormals.append(edgeNormal)
@@ -221,7 +242,8 @@ def updateDict( hitPositions, hitNormals, rayIndexs, N, axis, edgeVertexs, edgeN
                 polygon.append( tuple(cubeIndex) )
                 if tuple(cubeIndex) in cubeData:
                     if edge in cubeData[tuple(cubeIndex)]['edgeVertexIndexs']:
-                        raise Exception('ups')
+                        #raise Exception('ups')
+                        print('ups')
                         cubeData[tuple(cubeIndex)]['edgeVertexIndexs'][edge].append(edgeVertexIndex)
                     else:
                         cubeData[tuple(cubeIndex)]['edgeVertexIndexs'][edge] = [ edgeVertexIndex ]
@@ -259,10 +281,8 @@ def rayMarch( rayPositions, axis, df, N, outDict, edgeVertexs, edgeNormals, poly
         surfaceHitPosition = rayPositions[ surfaceHitRays ]
 
         if np.sum(surfaceHitRays) > 0:
-            surfaceHitNormals = g_df( surfaceHitPosition )
             updateDict( 
                 surfaceHitPosition,
-                surfaceHitNormals,
                 rayIndexs[surfaceHitRays],
                 N,
                 axis,
@@ -272,7 +292,8 @@ def rayMarch( rayPositions, axis, df, N, outDict, edgeVertexs, edgeNormals, poly
                 polygons
             )
             
-            rayPositions[surfaceHitRays, axis] =  (np.floor( (surfaceHitPosition[:, axis] + 1) * ((N-1)/2) ) + 1 + np.random.uniform(0, 2/(N-1))) * (2/(N-1)) - 1
+            #rayPositions[surfaceHitRays, axis] =  (np.floor( (surfaceHitPosition[:, axis] + 1) * ((N-1)/2) ) + 1) * (2/(N-1)) - 1 + np.random.uniform(2/(8*(N-1)), 2/(4*(N-1)))
+            rayPositions[surfaceHitRays, axis] =  (np.floor( (surfaceHitPosition[:, axis] + 1) * ((N-1)/2) ) + 1 ) * (2/(N-1)) - 1
 
 
 def cubeVertexs( N, df, surfaceThresh ):
@@ -287,37 +308,36 @@ def cubeVertexs( N, df, surfaceThresh ):
     return cubeData, np.array(edgeVertexs),np.array(edgeNormals), polygons
 
 def cubeCenterVertex( cubeData, edgeVertexs, edgeNormals, N, threshold, alpha=6 ):
-    global corners
     for cubeIdx, cubeInfo in cubeData.items():
         X = np.array( [ np.mean(edgeVertexs[ idxPerEdge ], axis=0) for idxPerEdge in cubeInfo['edgeVertexIndexs'].values() ])
         A = np.array( [ np.mean(edgeNormals[ idxPerEdge ], axis=0) for idxPerEdge in cubeInfo['edgeVertexIndexs'].values() ])
 
-        G = X @ X.T
-        P = -2 * G + np.outer( np.diag(G), np.ones(X.shape[0]) ) + np.outer( np.ones(X.shape[0]), np.diag(G) )
+        if alpha is not None:
+            G = X @ X.T
+            P = -2 * G + np.outer( np.diag(G), np.ones(X.shape[0]) ) + np.outer( np.ones(X.shape[0]), np.diag(G) )
 
-        X_new = []
-        A_new = []
-        for components in nx.connected_components( nx.from_numpy_array( P < (2/(alpha*(N-1)) ) ** 2 )):
-            X_new.append( np.mean( X[np.array(list(components)) ], axis=0 ))
-            A_new.append( np.mean( A[np.array(list(components)) ], axis=0 ))
+            X_new = []
+            A_new = []
+            for components in nx.connected_components( nx.from_numpy_array( P < (2/(alpha*(N-1)) ) ** 2 )):
+                X_new.append( np.mean( X[np.array(list(components)) ], axis=0 ))
+                A_new.append( np.mean( A[np.array(list(components)) ], axis=0 ))
 
-        X_new = np.array(X_new)
-        A_new = np.array(A_new)
+            X = np.array(X_new)
+            A = np.array(A_new)
 
-        cubeData[cubeIdx]['X'] = X_new
-        cubeData[cubeIdx]['A'] = A_new
+        cubeData[cubeIdx]['X'] = X
+        cubeData[cubeIdx]['A'] = A
 
-        if len(A_new) == 1:
-            cubeData[cubeIdx]['vertex'] = X_new.flatten()
+        if len(A) == 1:
+            cubeData[cubeIdx]['vertex'] = X.flatten()
         else:
-            b = np.sum( A_new * X_new, axis=1).flatten()
-            dual = dualContour( X_new, A_new, b, threshold=threshold )
+            b = np.sum( A * X, axis=1).flatten()
 
-            #dual = dualContour( A, b, threshold=threshold )
-            #bounds = [ (-1 + i*2/(N-1), -1 + (i+1)*2/(N-1)) for i in cubeIdx ]
-            #dual = dualContour( A, b, np.sum(X, axis=0) / X.shape[0], bounds )
+            #dual = weightedLeastSquares( np.diag(ws), X, A, b, threshold=threshold )
+            dual = dualContour( X, A, b, threshold=threshold )
+            #dual = grad_desc( dual.reshape((1,3)) )
 
-            cubeData[cubeIdx]['vertex'] = dual # x.flatten()
+            cubeData[cubeIdx]['vertex'] = dual.flatten()
 
 def getVertexIndex( cubeIndex, cubeData, vertexIndexs, vertices):
     if cubeIndex not in vertexIndexs:
@@ -335,8 +355,7 @@ def generateSurface( cubeData, polygons ):
     for polygon in polygons:
         if len(polygon) == 4:
             t1 = [ getVertexIndex( cubeIndex, cubeData, vertexIndexs, vertices ) for cubeIndex in polygon[:3]]
-            t2 = [ getVertexIndex( cubeIndex, cubeData, vertexIndexs, vertices ) for cubeIndex in polygon[1:]] #reversed(polygon[1:])]
-
+            t2 = [ getVertexIndex( cubeIndex, cubeData, vertexIndexs, vertices ) for cubeIndex in reversed(polygon[1:])]
 
             triangles.append(t1)
             triangles.append(t2)
